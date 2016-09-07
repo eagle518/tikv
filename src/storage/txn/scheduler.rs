@@ -52,10 +52,6 @@ use super::super::metrics::*;
 // TODO: make it configurable.
 pub const GC_BATCH_SIZE: usize = 512;
 
-pub enum Tick {
-    ReportStatistic,
-}
-
 /// Process result of a command.
 pub enum ProcessResult {
     Res,
@@ -489,10 +485,13 @@ impl Scheduler {
         assert_eq!(ctx.cid, cid);
         SCHED_CONTEX_GAUGE.set(self.cmd_ctxs.len() as f64);
         let histogram = SCHED_HISTOGRAM_VEC.with_label_values(&[ctx.tag]);
-        // TODO: Use HistogramTimer directly.
-        // https://github.com/pingcap/rust-prometheus/pull/51
         histogram.observe(duration_to_seconds(ctx.start.elapsed()));
         ctx
+    }
+
+    fn get_ctx_tag(&self, cid: u64) -> &'static str {
+        let ctx = self.cmd_ctxs.get(&cid).unwrap();
+        ctx.tag
     }
 
     /// Generates the lock for a command.
@@ -516,7 +515,7 @@ impl Scheduler {
 
     /// Delivers a command to a worker thread for processing.
     fn process_by_worker(&mut self, cid: u64, snapshot: Box<Snapshot>) {
-        SCHED_STAGE_COUNTER_VEC.with_label_values(&["process"]).inc();
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "process"]).inc();
         debug!("process cmd with snapshot, cid={}", cid);
         let cmd = {
             let ctx = &mut self.cmd_ctxs.get_mut(&cid).unwrap();
@@ -535,6 +534,7 @@ impl Scheduler {
     /// Calls the callback with an error.
     fn finish_with_err(&mut self, cid: u64, err: Error) {
         debug!("command cid={}, finished with error", cid);
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "error"]).inc();
 
         let mut ctx = self.remove_ctx(cid);
         let cb = ctx.callback.take().unwrap();
@@ -561,7 +561,7 @@ impl Scheduler {
     /// execution because 1) all the conflicting commands (if any) must be in the waiting queues;
     /// 2) there may be non-conflicitng commands running concurrently, but it doesn't matter.
     fn on_receive_new_cmd(&mut self, cmd: Command, callback: StorageCb) {
-        SCHED_STAGE_COUNTER_VEC.with_label_values(&["new"]).inc();
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[cmd.tag(), "new"]).inc();
         let cid = self.gen_id();
         debug!("received new command, cid={}, cmd={}", cid, cmd);
         let lock = self.gen_lock(&cmd);
@@ -585,7 +585,7 @@ impl Scheduler {
     /// Initiates an async operation to get a snapshot from the storage engine, then posts a
     /// `SnapshotFinished` message back to the event loop when it finishes.
     fn get_snapshot(&mut self, cid: u64) {
-        SCHED_STAGE_COUNTER_VEC.with_label_values(&["snapshot"]).inc();
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "snapshot"]).inc();
         let ch = self.schedch.clone();
         let cb = box move |snapshot: EngineResult<Box<Snapshot>>| {
             if let Err(e) = ch.send(Msg::SnapshotFinished {
@@ -606,6 +606,7 @@ impl Scheduler {
     /// Delivers the command along with the snapshot to a worker thread to execute.
     fn on_snapshot_finished(&mut self, cid: u64, snapshot: EngineResult<Box<Snapshot>>) {
         debug!("receive snapshot finish msg for cid={}", cid);
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "snapshot_finish"]).inc();
         match snapshot {
             Ok(snapshot) => self.process_by_worker(cid, snapshot),
             Err(e) => self.finish_with_err(cid, Error::from(e)),
@@ -618,10 +619,12 @@ impl Scheduler {
     /// callback.
     fn on_read_finished(&mut self, cid: u64, pr: ProcessResult) {
         debug!("read command(cid={}) finished", cid);
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "read_finish"]).inc();
 
         let mut ctx = self.remove_ctx(cid);
         let cb = ctx.callback.take().unwrap();
         if let ProcessResult::NextCommand { cmd } = pr {
+            SCHED_STAGE_COUNTER_VEC.with_label_values(&[ctx.tag(), "next_cmd"]).inc();
             self.on_receive_new_cmd(cmd, cb);
         } else {
             execute_callback(cb, pr);
@@ -654,7 +657,7 @@ impl Scheduler {
                                  cmd: Command,
                                  pr: ProcessResult,
                                  to_be_write: Vec<Modify>) {
-        SCHED_STAGE_COUNTER_VEC.with_label_values(&["write"]).inc();
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "write"]).inc();
         if let Err(e) = {
             let engine_cb = make_engine_cb(cid, pr, self.schedch.clone());
             self.engine.async_write(extract_ctx(&cmd), to_be_write, engine_cb)
@@ -669,7 +672,7 @@ impl Scheduler {
 
     /// Event handler for the success of write.
     fn on_write_finished(&mut self, cid: u64, pr: ProcessResult, result: EngineResult<()>) {
-        SCHED_STAGE_COUNTER_VEC.with_label_values(&["write_finish"]).inc();
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "write_finish"]).inc();
         debug!("write finished for command, cid={}", cid);
         let mut ctx = self.remove_ctx(cid);
         let cb = ctx.callback.take().unwrap();
@@ -678,6 +681,7 @@ impl Scheduler {
             Err(e) => ProcessResult::Failed { err: ::storage::Error::from(e) },
         };
         if let ProcessResult::NextCommand { cmd } = pr {
+            SCHED_STAGE_COUNTER_VEC.with_label_values(&[ctx.tag(), "next_cmd"]).inc();
             self.on_receive_new_cmd(cmd, cb);
         } else {
             execute_callback(cb, pr);
@@ -710,7 +714,7 @@ impl Scheduler {
 
 /// Handler of the scheduler event loop.
 impl mio::Handler for Scheduler {
-    type Timeout = Tick;
+    type Timeout = ();
     type Message = Msg;
 
     /// Event handler for message events.

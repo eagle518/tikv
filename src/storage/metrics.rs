@@ -25,7 +25,7 @@ lazy_static! {
         register_counter_vec!(
             "tikv_scheduler_stage_total",
             "Total number of commands on each stage.",
-            &["stage"]
+            &["type", "stage"]
         ).unwrap();
 
     pub static ref SCHED_CONTEX_GAUGE: Gauge =
